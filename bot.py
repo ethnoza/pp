@@ -68,6 +68,13 @@ async def mention_is_chat(bot: Bot, username: str) -> bool:
     return _mention_cache[key]
 
 
+def _bot_allowed(user, bot: Bot) -> bool:
+    """Наш бот и боты из ALLOWED_CHATS могут писать, остальные — нет."""
+    if user.id == bot.id:
+        return True
+    return (user.username or "").lower() in {a.lower().lstrip("@") for a in ALLOWED}
+
+
 async def find_reason(message: Message, bot: Bot) -> str | None:
     chat = message.chat
     raw = message.text or message.caption or ""
@@ -114,6 +121,21 @@ async def find_reason(message: Message, bot: Bot) -> str | None:
     return None
 
 
+@dp.message(GROUPS, F.new_chat_members)
+async def kick_added_bots(message: Message, bot: Bot) -> None:
+    """Выгоняет чужих ботов, которых добавил не админ."""
+    adder = message.from_user
+    if adder and await is_admin(bot, message.chat.id, adder.id):
+        return
+    for member in message.new_chat_members:
+        if member.is_bot and not _bot_allowed(member, bot):
+            try:
+                await bot.ban_chat_member(message.chat.id, member.id)
+                log.info("Выгнан бот @%s из «%s»", member.username, message.chat.title)
+            except TelegramAPIError as exc:
+                log.warning("Не удалось выгнать бота @%s: %s", member.username, exc)
+
+
 @dp.message(GROUPS)
 @dp.edited_message(GROUPS)
 async def moderate(message: Message, bot: Bot) -> None:
@@ -123,21 +145,37 @@ async def moderate(message: Message, bot: Bot) -> None:
         return
     if message.sender_chat and message.sender_chat.id == chat.id:
         return
-    # Ответ гостевого бота (бот не состоит в группе, его вызвал участник через @упоминание).
+    # Чужие боты: участники-боты, гостевые боты (вызов через @упоминание) и инлайн-боты (via).
+    sender = message.from_user
     caller = message.guest_bot_caller_user
-    if caller:
-        if await is_admin(bot, chat.id, caller.id):
-            return
+    human = caller or (sender if sender and not sender.is_bot and not message.sender_chat else None)
+    human_is_admin = bool(human) and await is_admin(bot, chat.id, human.id)
+
+    reason = None
+    if sender and sender.is_bot and not message.sender_chat and not _bot_allowed(sender, bot):
+        # Бот пишет сам: удаляем всегда, кроме ответа на вызов админа.
+        if not (caller and human_is_admin):
+            reason = f"сообщение чужого бота @{sender.username}"
+            if caller:
+                reason += f" по вызову {caller.full_name}"
+    elif human_is_admin:
+        return
+    elif caller:
         reason = f"ответ гостевого бота по вызову {caller.full_name}"
+    elif message.via_bot and not _bot_allowed(message.via_bot, bot):
+        reason = f"сообщение через бота @{message.via_bot.username}"
     else:
-        if message.from_user and not message.sender_chat:
-            if await is_admin(bot, chat.id, message.from_user.id):
-                return
         reason = await find_reason(message, bot)
     if not reason:
         return
 
-    who = message.sender_chat.title if message.sender_chat else message.from_user.full_name
+    who = (
+        message.sender_chat.title
+        if message.sender_chat
+        else message.from_user.full_name
+        if message.from_user
+        else "?"
+    )
     try:
         await message.delete()
         log.info("Удалено в «%s» от %s — %s", chat.title, who, reason)
