@@ -9,9 +9,9 @@ import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import Message
+from aiogram.types import ChatPermissions, Message
 
-from spamfilter import check_text
+from spamfilter import check_text, find_bot_call, find_bot_mention
 
 log = logging.getLogger("antispam")
 
@@ -29,6 +29,9 @@ ALLOWED = [a.strip() for a in os.getenv("ALLOWED_CHATS", "").split(",") if a.str
 CHECK_PHRASES = _flag("CHECK_PHRASES", True)
 # Удалять пересылки из чужих каналов и групп.
 DELETE_FORWARDS = _flag("DELETE_FORWARDS", False)
+# Что делать с тем, кто вызвал чужого бота сообщением вида "@SomeBot код"
+# (так рассылают спам со взломанных аккаунтов): mute — запретить писать, ban — забанить, delete — только удалить.
+ON_BOT_CALL = os.getenv("ON_BOT_CALL", "mute").strip().lower()
 
 ADMIN_CACHE_TTL = 300
 _admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
@@ -67,6 +70,11 @@ async def mention_is_chat(bot: Bot, username: str) -> bool:
 
 async def find_reason(message: Message, bot: Bot) -> str | None:
     chat = message.chat
+    raw = message.text or message.caption or ""
+    bot_name = find_bot_mention(raw, ALLOWED)
+    if bot_name:
+        return f"упоминание бота: @{bot_name}"
+
     text = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or []
 
@@ -115,11 +123,17 @@ async def moderate(message: Message, bot: Bot) -> None:
         return
     if message.sender_chat and message.sender_chat.id == chat.id:
         return
-    if message.from_user and not message.sender_chat:
-        if await is_admin(bot, chat.id, message.from_user.id):
+    # Ответ гостевого бота (бот не состоит в группе, его вызвал участник через @упоминание).
+    caller = message.guest_bot_caller_user
+    if caller:
+        if await is_admin(bot, chat.id, caller.id):
             return
-
-    reason = await find_reason(message, bot)
+        reason = f"ответ гостевого бота по вызову {caller.full_name}"
+    else:
+        if message.from_user and not message.sender_chat:
+            if await is_admin(bot, chat.id, message.from_user.id):
+                return
+        reason = await find_reason(message, bot)
     if not reason:
         return
 
@@ -129,6 +143,21 @@ async def moderate(message: Message, bot: Bot) -> None:
         log.info("Удалено в «%s» от %s — %s", chat.title, who, reason)
     except TelegramAPIError as exc:
         log.warning("Не удалось удалить в «%s» (%s): %s", chat.title, reason, exc)
+
+    # Сообщение целиком "@SomeBot код" — аккаунт, скорее всего, взломан и рассылает спам.
+    offender = caller or (message.from_user if not message.sender_chat else None)
+    is_call = caller or find_bot_call(message.text or message.caption or "", ALLOWED)
+    if offender and is_call and not offender.is_bot and ON_BOT_CALL in {"mute", "ban"}:
+        try:
+            if ON_BOT_CALL == "ban":
+                await bot.ban_chat_member(chat.id, offender.id)
+            else:
+                await bot.restrict_chat_member(
+                    chat.id, offender.id, ChatPermissions(can_send_messages=False)
+                )
+            log.info("%s в «%s»: %s", "Бан" if ON_BOT_CALL == "ban" else "Мут", chat.title, offender.full_name)
+        except TelegramAPIError as exc:
+            log.warning("Не удалось ограничить %s в «%s»: %s", offender.full_name, chat.title, exc)
 
 
 async def main() -> None:

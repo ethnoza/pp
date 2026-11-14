@@ -36,6 +36,10 @@ _PHRASES = [
     re.compile(rf"\b(?:нов\w+|наш\w*|мо[йюеё]\w*|друг\w+|основн\w+|резервн\w+)\s+(?:\w+\s+)?{_TARGET}"),
     # "группа переехала", "канал теперь тут"
     re.compile(rf"\b{_TARGET}\w*\s+(?:переехал|теперь\s+(?:тут|здесь|по\s+ссылке))"),
+    # "чат переносится в новую группу"
+    re.compile(rf"\b{_TARGET}\w*\s+(?:переносится|переезжает|перенесен|перемещается)"),
+    # "нажмите на этот текст, чтобы перейти в группу"
+    re.compile(r"\bнажмите\b.{0,60}?\bчтобы\s+(?:перейти|присоединиться|вступить)", re.DOTALL),
     # "ссылка в профиле/био"
     re.compile(r"\bссылк\w*\s+(?:в|на)\s+(?:мо[её]м\s+)?(?:профил|био|bio|описани|шапк)"),
 ]
@@ -45,6 +49,28 @@ _PHRASES_EN = [
     re.compile(r"\b(?:our|my)\s+new\s+(?:group|channel|chat)\b"),
     re.compile(r"\b(?:subscribe|follow)\s+(?:to\s+)?(?:our|my|the)\s+(?:\w+\s+)?(?:group|channel|chat)"),
 ]
+
+
+# Вызов гостевого бота: всё сообщение — "@SomeBot <код>" (так запускается рассылка от имени участника).
+_BOT_CALL_RE = re.compile(r"\s*@(\w*bot)\b[^\n]{0,64}\s*", re.IGNORECASE)
+_BOT_MENTION_RE = re.compile(r"@(\w*bot)\b", re.IGNORECASE)
+
+
+def find_bot_call(text: str, allowed: Iterable[str] = ()) -> Optional[str]:
+    """Юзернейм бота, если сообщение целиком является вызовом бота, иначе None."""
+    m = _BOT_CALL_RE.fullmatch(text or "")
+    if m and m.group(1).lower() not in {a.lower().lstrip("@") for a in allowed}:
+        return m.group(1)
+    return None
+
+
+def find_bot_mention(text: str, allowed: Iterable[str] = ()) -> Optional[str]:
+    """Юзернейм первого упомянутого бота (@...bot), не входящего в разрешённые."""
+    allowed_set = {a.lower().lstrip("@") for a in allowed}
+    for m in _BOT_MENTION_RE.finditer(text or ""):
+        if m.group(1).lower() not in allowed_set:
+            return m.group(1)
+    return None
 
 
 def _normalize(text: str) -> str:
